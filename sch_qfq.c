@@ -790,6 +790,12 @@ static bool qfq_update_class(struct qfq_group *grp, struct qfq_class *cl)
 	return true;
 }
 
+static struct sk_buff *qfq_dummy_dequeue(struct Qdisc *sch)
+{
+	qdisc_throttled(sch);
+	return NULL;
+}
+
 static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 {
 	struct qfq_sched *q = qdisc_priv(sch);
@@ -1092,14 +1098,44 @@ static int qfq_spinner(void *_qdisc)
 	struct qfq_sched *q = qdisc_priv(sch);
 	struct task_struct *tsk = current;
 	struct sched_param param = { .sched_priority = MAX_RT_PRIO - 1 };
+	spinlock_t *root_lock;
+	struct sk_buff *skb;
+	struct net_device *dev;
+	struct netdev_queue *txq;
+	int ret;
 
 	sched_setscheduler(tsk, SCHED_FIFO, &param);
 	printk(KERN_INFO "Kernel thread qfq-spinner on cpu %d args %p q %p\n", smp_processor_id(), sch, q);
 
 	while (!kthread_should_stop()) {
-		set_current_state(TASK_INTERRUPTIBLE);
-		_cond_resched();
-		__set_current_state(TASK_RUNNING);
+		if (sch->q.qlen == 0) {
+			schedule();
+			continue;
+		}
+
+		root_lock = qdisc_lock(sch);
+		if (!spin_trylock(root_lock))
+			continue;
+
+		/* Call the real dequeue function */
+		skb = qfq_dequeue(sch);
+		if (unlikely(!skb))
+			goto unlock;
+
+		dev = qdisc_dev(sch);
+
+		/* Always pick queue 0 */
+		txq = netdev_get_tx_queue(dev, 0);
+
+		/* The kernel does a lot of stuff which we can quickly
+		 * bypass.  We know the features of our NIC --
+		 * supports hardware checksumming, supports GSO, etc.
+		 * And, only one thread dequeues packets.  So we don't
+		 * need any lock.
+		 */
+		ret = dev->netdev_ops->ndo_start_xmit(skb, dev);
+	unlock:
+		spin_unlock(root_lock);
 	}
 
 	printk(KERN_INFO "Kernel thread qfq-spinner stopped on cpu %d\n", smp_processor_id());
@@ -1208,7 +1244,8 @@ static struct Qdisc_ops qfq_qdisc_ops __read_mostly = {
 	.id		= "qfq",
 	.priv_size	= sizeof(struct qfq_sched),
 	.enqueue	= qfq_enqueue,
-	.dequeue	= qfq_dequeue,
+	/*.dequeue	= qfq_dequeue, */
+	.dequeue        = qfq_dummy_dequeue,
 	.peek		= qdisc_peek_dequeued,
 	.drop		= qfq_drop,
 	.init		= qfq_init_qdisc,
