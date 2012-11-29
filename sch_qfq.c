@@ -1098,7 +1098,7 @@ static int qfq_spinner(void *_qdisc)
 
 	while (!kthread_should_stop()) {
 		set_current_state(TASK_INTERRUPTIBLE);
-		schedule();
+		_cond_resched();
 		__set_current_state(TASK_RUNNING);
 	}
 
