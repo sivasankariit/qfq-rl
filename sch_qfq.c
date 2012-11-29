@@ -1116,15 +1116,17 @@ static int qfq_spinner(void *_qdisc)
 		root_lock = qdisc_lock(sch);
 		if (!spin_trylock(root_lock))
 			continue;
-
 		/* Call the real dequeue function */
 		skb = qfq_dequeue(sch);
+		spin_unlock(root_lock);
+
 		if (unlikely(!skb))
-			goto unlock;
+			continue;
 
 		dev = qdisc_dev(sch);
 
 		/* Always pick queue 0 */
+		skb_set_queue_mapping(skb, 0);
 		txq = netdev_get_tx_queue(dev, 0);
 
 		/* The kernel does a lot of stuff which we can quickly
@@ -1133,9 +1135,7 @@ static int qfq_spinner(void *_qdisc)
 		 * And, only one thread dequeues packets.  So we don't
 		 * need any lock.
 		 */
-		ret = dev->netdev_ops->ndo_start_xmit(skb, dev);
-	unlock:
-		spin_unlock(root_lock);
+		 ret = dev->netdev_ops->ndo_start_xmit(skb, dev);
 	}
 
 	printk(KERN_INFO "Kernel thread qfq-spinner stopped on cpu %d\n", smp_processor_id());
