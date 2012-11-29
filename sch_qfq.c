@@ -100,7 +100,7 @@
 #define QFQ_MTU_SHIFT		11
 #define QFQ_MIN_SLOT_SHIFT	(FRAC_BITS + QFQ_MTU_SHIFT - QFQ_MAX_INDEX)
 
-static int spin_cpu = 7;
+static int spin_cpu = 2;
 /* Module parameter and sysfs export */
 module_param    (spin_cpu, int, 0640);
 MODULE_PARM_DESC(spin_cpu, "CPU to spin on. Ensure no processes are scheduled here to minimise context switches.");
@@ -1090,17 +1090,19 @@ static int qfq_spinner(void *_qdisc)
 {
 	struct Qdisc *sch = _qdisc;
 	struct qfq_sched *q = qdisc_priv(sch);
-	printk(KERN_INFO "Kernel thread qfq-spinner on cpu %d args %p q %p\n", smp_processor_id(), sch, q);
-	static u64 count = 5000000000LLU;
+	struct task_struct *tsk = current;
+	struct sched_param param = { .sched_priority = MAX_RT_PRIO - 1 };
 
-	while (count > 0) {
-		count--;
-		if (test_bit(0, &q->should_stop))
-			break;
-		cpu_relax();
+	sched_setscheduler(tsk, SCHED_FIFO, &param);
+	printk(KERN_INFO "Kernel thread qfq-spinner on cpu %d args %p q %p\n", smp_processor_id(), sch, q);
+
+	while (!kthread_should_stop()) {
+		set_current_state(TASK_INTERRUPTIBLE);
+		schedule();
+		__set_current_state(TASK_RUNNING);
 	}
 
-	printk(KERN_INFO "Kernel thread qfq-spinner stopped on cpu %d with count %llu\n", smp_processor_id(), count);
+	printk(KERN_INFO "Kernel thread qfq-spinner stopped on cpu %d\n", smp_processor_id());
 	return 0;
 }
 
@@ -1127,9 +1129,6 @@ static int qfq_init_qdisc(struct Qdisc *sch, struct nlattr *opt)
 	q->spinner = kthread_create(qfq_spinner, (void *)sch, "qfq-spinner");
 
 	/* In case the thread goes away ... */
-	get_task_struct(q->spinner);
-	q->should_stop = 0;
-
 	if (!IS_ERR(q->spinner)) {
 		smp_mb();
 		kthread_bind(q->spinner, spin_cpu);
@@ -1173,10 +1172,7 @@ static void qfq_destroy_qdisc(struct Qdisc *sch)
 
 	printk(KERN_INFO "waiting for thread %p to stop\n", q->spinner);
 	if (!IS_ERR(q->spinner)) {
-		set_bit(0, &q->should_stop);
-		smp_mb();
 		kthread_stop(q->spinner);
-		put_task_struct(q->spinner);
 	}
 
 	tcf_destroy_chain(&q->filter_list);
