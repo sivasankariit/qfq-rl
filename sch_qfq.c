@@ -18,6 +18,9 @@
 #include <net/pkt_sched.h>
 #include <net/pkt_cls.h>
 
+#include <linux/kernel.h>
+#include <linux/sched.h>
+#include <linux/kthread.h>
 
 /*  Quick Fair Queueing
     ===================
@@ -97,6 +100,11 @@
 #define QFQ_MTU_SHIFT		11
 #define QFQ_MIN_SLOT_SHIFT	(FRAC_BITS + QFQ_MTU_SHIFT - QFQ_MAX_INDEX)
 
+static int spin_cpu = 7;
+/* Module parameter and sysfs export */
+module_param    (spin_cpu, int, 0640);
+MODULE_PARM_DESC(spin_cpu, "CPU to spin on. Ensure no processes are scheduled here to minimise context switches.");
+
 /*
  * Possible group states.  These values are used as indexes for the bitmaps
  * array of struct qfq_queue.
@@ -150,6 +158,9 @@ struct qfq_sched {
 
 	unsigned long bitmaps[QFQ_MAX_STATE];	    /* Group bitmaps. */
 	struct qfq_group groups[QFQ_MAX_INDEX + 1]; /* The groups. */
+
+	struct task_struct *spinner;
+	volatile unsigned long should_stop;
 };
 
 static struct qfq_class *qfq_find_class(struct Qdisc *sch, u32 classid)
@@ -1075,6 +1086,24 @@ static unsigned int qfq_drop(struct Qdisc *sch)
 	return 0;
 }
 
+static int qfq_spinner(void *_qdisc)
+{
+	struct Qdisc *sch = _qdisc;
+	struct qfq_sched *q = qdisc_priv(sch);
+	printk(KERN_INFO "Kernel thread qfq-spinner on cpu %d args %p q %p\n", smp_processor_id(), sch, q);
+	static u64 count = 5000000000LLU;
+
+	while (count > 0) {
+		count--;
+		if (test_bit(0, &q->should_stop))
+			break;
+		cpu_relax();
+	}
+
+	printk(KERN_INFO "Kernel thread qfq-spinner stopped on cpu %d with count %llu\n", smp_processor_id(), count);
+	return 0;
+}
+
 static int qfq_init_qdisc(struct Qdisc *sch, struct nlattr *opt)
 {
 	struct qfq_sched *q = qdisc_priv(sch);
@@ -1092,6 +1121,19 @@ static int qfq_init_qdisc(struct Qdisc *sch, struct nlattr *opt)
 				   - (QFQ_MAX_INDEX - i);
 		for (j = 0; j < QFQ_MAX_SLOTS; j++)
 			INIT_HLIST_HEAD(&grp->slots[j]);
+	}
+
+	printk(KERN_INFO "Creating spinner args %p q %p\n", sch, q);
+	q->spinner = kthread_create(qfq_spinner, (void *)sch, "qfq-spinner");
+
+	/* In case the thread goes away ... */
+	get_task_struct(q->spinner);
+	q->should_stop = 0;
+
+	if (!IS_ERR(q->spinner)) {
+		smp_mb();
+		kthread_bind(q->spinner, spin_cpu);
+		wake_up_process(q->spinner);
 	}
 
 	return 0;
@@ -1129,6 +1171,14 @@ static void qfq_destroy_qdisc(struct Qdisc *sch)
 	struct hlist_node *n, *next;
 	unsigned int i;
 
+	printk(KERN_INFO "waiting for thread %p to stop\n", q->spinner);
+	if (!IS_ERR(q->spinner)) {
+		set_bit(0, &q->should_stop);
+		smp_mb();
+		kthread_stop(q->spinner);
+		put_task_struct(q->spinner);
+	}
+
 	tcf_destroy_chain(&q->filter_list);
 
 	for (i = 0; i < q->clhash.hashsize; i++) {
@@ -1137,6 +1187,7 @@ static void qfq_destroy_qdisc(struct Qdisc *sch)
 			qfq_destroy_class(sch, cl);
 		}
 	}
+
 	qdisc_class_hash_destroy(&q->clhash);
 }
 

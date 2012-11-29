@@ -4,6 +4,8 @@ dev=eth4
 
 tc qdisc del dev $dev root
 rmmod sch_qfq
+make
+
 insmod ./sch_qfq.ko
 tc qdisc add dev $dev root handle 1: qfq
 tc class add dev $dev parent 1: classid 1:1 qfq weight 1 maxpkt 2048
