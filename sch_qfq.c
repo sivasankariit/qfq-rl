@@ -17,6 +17,7 @@
 #include <net/sch_generic.h>
 #include <net/pkt_sched.h>
 #include <net/pkt_cls.h>
+#include <trace/events/net.h>
 
 #include <linux/kernel.h>
 #include <linux/sched.h>
@@ -1099,10 +1100,11 @@ static int qfq_spinner(void *_qdisc)
 	struct task_struct *tsk = current;
 	struct sched_param param = { .sched_priority = MAX_RT_PRIO - 1 };
 	spinlock_t *root_lock;
-	struct sk_buff *skb;
+	struct sk_buff *skb = NULL;
 	struct net_device *dev;
 	struct netdev_queue *txq;
-	int ret;
+	unsigned int skb_len;
+	int rc;
 
 	sched_setscheduler(tsk, SCHED_FIFO, &param);
 	printk(KERN_INFO "Kernel thread qfq-spinner on cpu %d args %p q %p\n", smp_processor_id(), sch, q);
@@ -1112,16 +1114,19 @@ static int qfq_spinner(void *_qdisc)
 			schedule();
 			continue;
 		}
+		local_bh_disable();
 
-		root_lock = qdisc_lock(sch);
-		if (!spin_trylock(root_lock))
-			continue;
-		/* Call the real dequeue function */
-		skb = qfq_dequeue(sch);
-		spin_unlock(root_lock);
+		if (likely(!skb)) {
+			root_lock = qdisc_lock(sch);
+			if (!spin_trylock(root_lock))
+				goto done;
+			/* Call the real dequeue function */
+			skb = qfq_dequeue(sch);
+			spin_unlock(root_lock);
 
-		if (unlikely(!skb))
-			continue;
+			if (unlikely(!skb))
+				goto done;
+		}
 
 		dev = qdisc_dev(sch);
 
@@ -1129,13 +1134,29 @@ static int qfq_spinner(void *_qdisc)
 		skb_set_queue_mapping(skb, 0);
 		txq = netdev_get_tx_queue(dev, 0);
 
+		/* Grab the txq lock and try to transmit */
+		HARD_TX_LOCK(dev, txq, smp_processor_id());
+
 		/* The kernel does a lot of stuff which we can quickly
 		 * bypass.  We know the features of our NIC --
 		 * supports hardware checksumming, supports GSO, etc.
 		 * And, only one thread dequeues packets.  So we don't
 		 * need any lock.
 		 */
-		 ret = dev->netdev_ops->ndo_start_xmit(skb, dev);
+		if (!netif_xmit_frozen_or_stopped(txq)) {
+			skb_len = skb->len;
+			rc = dev->netdev_ops->ndo_start_xmit(skb, dev);
+			/* We should trace ndo_start_xmit similar to the way it
+			 * is used in other places, but compiler complains that
+			 * symbol was not found.
+			/* trace_net_dev_xmit(skb, rc, dev, skb_len); */
+			if (rc == NETDEV_TX_OK)
+				txq_trans_update(txq);
+			skb = NULL;
+		}
+		HARD_TX_UNLOCK(dev, txq);
+done:
+		local_bh_enable();
 	}
 
 	printk(KERN_INFO "Kernel thread qfq-spinner stopped on cpu %d\n", smp_processor_id());
@@ -1219,7 +1240,6 @@ static void qfq_destroy_qdisc(struct Qdisc *sch)
 			qfq_destroy_class(sch, cl);
 		}
 	}
-
 	qdisc_class_hash_destroy(&q->clhash);
 }
 
