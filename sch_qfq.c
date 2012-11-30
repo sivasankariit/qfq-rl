@@ -1149,6 +1149,7 @@ static int qfq_spinner(void *_qdisc)
 			/* We should trace ndo_start_xmit similar to the way it
 			 * is used in other places, but compiler complains that
 			 * symbol was not found.
+             */
 			/* trace_net_dev_xmit(skb, rc, dev, skb_len); */
 			if (rc == NETDEV_TX_OK)
 				txq_trans_update(txq);
