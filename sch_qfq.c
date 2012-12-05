@@ -161,7 +161,14 @@ struct qfq_sched {
 	struct qfq_group groups[QFQ_MAX_INDEX + 1]; /* The groups. */
 
 	struct task_struct *spinner;
-	volatile unsigned long should_stop;
+
+	/* stats variables */
+	u64	v_forwarded;	/* V was forward to match S of some group in
+				 * order to avoid a non work conserving
+				 * schedule
+				 */
+	u64	idle_on_deq; /* Queue was idle after a dequeue operation */
+	u64	update_grp_on_deq; /* Group needed update upon dequeue */
 };
 
 static struct qfq_class *qfq_find_class(struct Qdisc *sch, u32 classid)
@@ -498,13 +505,9 @@ static int qfq_dump_class_stats(struct Qdisc *sch, unsigned long arg,
 				struct gnet_dump *d)
 {
 	struct qfq_class *cl = (struct qfq_class *)arg;
-	struct tc_qfq_stats xstats;
+	struct tc_qfq_xstats xstats = {.type = TCA_QFQ_XSTATS_CLASS};
 
-	memset(&xstats, 0, sizeof(xstats));
 	cl->qdisc->qstats.qlen = cl->qdisc->q.qlen;
-
-	xstats.weight = ONE_FP/cl->inv_w;
-	xstats.lmax = cl->lmax;
 
 	if (gnet_stats_copy_basic(d, &cl->bstats) < 0 ||
 	    gnet_stats_copy_rate_est(d, &cl->bstats, &cl->rate_est) < 0 ||
@@ -759,10 +762,14 @@ static void qfq_update_eligible(struct qfq_sched *q, u64 old_V)
 	if (ineligible) {
 		if (!q->bitmaps[ER]) {
 			grp = qfq_ffs(q, ineligible);
-			if (qfq_gt(grp->S, q->V))
+			if (qfq_gt(grp->S, q->V)) {
 				q->V = grp->S;
+				q->v_forwarded++;
+			}
 		}
 		qfq_make_eligible(q, old_V);
+	} else if (!q->bitmaps[ER]) {
+		q->idle_on_deq++;
 	}
 }
 
@@ -829,6 +836,8 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 
 	if (qfq_update_class(grp, cl)) {
 		u64 old_F = grp->F;
+
+		q->update_grp_on_deq++;
 
 		cl = qfq_slot_scan(grp);
 		if (!cl)
@@ -1093,6 +1102,18 @@ static unsigned int qfq_drop(struct Qdisc *sch)
 	return 0;
 }
 
+static int qfq_dump_qdisc_stats(struct Qdisc *sch, struct gnet_dump *d)
+{
+	struct qfq_sched *q = qdisc_priv(sch);
+	struct tc_qfq_xstats xstats = {.type = TCA_QFQ_XSTATS_QDISC};
+
+	xstats.qdisc_stats.v_forwarded = q->v_forwarded;
+	xstats.qdisc_stats.idle_on_deq = q->idle_on_deq;
+	xstats.qdisc_stats.update_grp_on_deq = q->update_grp_on_deq;
+
+	return gnet_stats_copy_app(d, &xstats, sizeof(xstats));
+}
+
 static int qfq_spinner(void *_qdisc)
 {
 	struct Qdisc *sch = _qdisc;
@@ -1182,6 +1203,10 @@ static int qfq_init_qdisc(struct Qdisc *sch, struct nlattr *opt)
 		for (j = 0; j < QFQ_MAX_SLOTS; j++)
 			INIT_HLIST_HEAD(&grp->slots[j]);
 	}
+
+	q->v_forwarded = 0;
+	q->idle_on_deq = 0;
+	q->update_grp_on_deq = 0;
 
 	printk(KERN_INFO "Creating spinner args %p q %p\n", sch, q);
 	q->spinner = kthread_create(qfq_spinner, (void *)sch, "qfq-spinner");
@@ -1273,6 +1298,7 @@ static struct Qdisc_ops qfq_qdisc_ops __read_mostly = {
 	.reset		= qfq_reset_qdisc,
 	.destroy	= qfq_destroy_qdisc,
 	.owner		= THIS_MODULE,
+	.dump_stats	= qfq_dump_qdisc_stats,
 };
 
 static int __init qfq_init(void)
