@@ -137,6 +137,9 @@ struct qfq_class {
 	/* these are copied from the flowset. */
 	u32	inv_w;		/* ONE_FP/weight */
 	u32	lmax;		/* Max packet size for this flow. */
+
+	/* stats variables */
+	u64 idle_on_deq; /* Class was idle after a dequeue from this class */
 };
 
 struct qfq_group {
@@ -167,8 +170,13 @@ struct qfq_sched {
 				 * order to avoid a non work conserving
 				 * schedule
 				 */
-	u64	idle_on_deq; /* Queue was idle after a dequeue operation */
+	u64	idle_on_deq; /* Qdisc was idle after a dequeue operation */
 	u64	update_grp_on_deq; /* Group needed update upon dequeue */
+	u64	txq_blocked; /* Interface frozen or stopped while trying to
+			      * transmit skb. For each skb dequeued from qdisc,
+			      * we increment this value at most once (not for
+			      * each time we retry).
+			      */
 };
 
 static struct qfq_class *qfq_find_class(struct Qdisc *sch, u32 classid)
@@ -507,6 +515,8 @@ static int qfq_dump_class_stats(struct Qdisc *sch, unsigned long arg,
 	struct qfq_class *cl = (struct qfq_class *)arg;
 	struct tc_qfq_xstats xstats = {.type = TCA_QFQ_XSTATS_CLASS};
 
+	xstats.class_stats.idle_on_deq = cl->idle_on_deq;
+
 	cl->qdisc->qstats.qlen = cl->qdisc->q.qlen;
 
 	if (gnet_stats_copy_basic(d, &cl->bstats) < 0 ||
@@ -781,9 +791,10 @@ static bool qfq_update_class(struct qfq_group *grp, struct qfq_class *cl)
 	unsigned int len = qdisc_peek_len(cl->qdisc);
 
 	cl->S = cl->F;
-	if (!len)
+	if (!len) {
 		qfq_front_slot_remove(grp);	/* queue is empty */
-	else {
+		cl->idle_on_deq++;
+	} else {
 		u64 roundedS;
 
 		cl->F = cl->S + (u64)len * cl->inv_w;
@@ -1110,6 +1121,7 @@ static int qfq_dump_qdisc_stats(struct Qdisc *sch, struct gnet_dump *d)
 	xstats.qdisc_stats.v_forwarded = q->v_forwarded;
 	xstats.qdisc_stats.idle_on_deq = q->idle_on_deq;
 	xstats.qdisc_stats.update_grp_on_deq = q->update_grp_on_deq;
+	xstats.qdisc_stats.txq_blocked = q->txq_blocked;
 
 	return gnet_stats_copy_app(d, &xstats, sizeof(xstats));
 }
@@ -1126,6 +1138,7 @@ static int qfq_spinner(void *_qdisc)
 	struct netdev_queue *txq;
 	unsigned int skb_len;
 	int rc;
+	int new_skb_deq = 0;
 
 	sched_setscheduler(tsk, SCHED_FIFO, &param);
 	printk(KERN_INFO "Kernel thread qfq-spinner on cpu %d args %p q %p\n", smp_processor_id(), sch, q);
@@ -1147,6 +1160,8 @@ static int qfq_spinner(void *_qdisc)
 
 			if (unlikely(!skb))
 				goto done;
+
+			new_skb_deq = 1;
 		}
 
 		dev = qdisc_dev(sch);
@@ -1170,11 +1185,18 @@ static int qfq_spinner(void *_qdisc)
 			/* We should trace ndo_start_xmit similar to the way it
 			 * is used in other places, but compiler complains that
 			 * symbol was not found.
-             */
+			 */
 			/* trace_net_dev_xmit(skb, rc, dev, skb_len); */
-			if (rc == NETDEV_TX_OK)
+			if (rc == NETDEV_TX_OK) {
 				txq_trans_update(txq);
-			skb = NULL;
+				skb = NULL;
+			} else if (new_skb_deq) {
+				new_skb_deq = 0;
+				q->txq_blocked++;
+			}
+		} else if (new_skb_deq) {
+			new_skb_deq = 0;
+			q->txq_blocked++;
 		}
 		HARD_TX_UNLOCK(dev, txq);
 done:
@@ -1207,6 +1229,7 @@ static int qfq_init_qdisc(struct Qdisc *sch, struct nlattr *opt)
 	q->v_forwarded = 0;
 	q->idle_on_deq = 0;
 	q->update_grp_on_deq = 0;
+	q->txq_blocked = 0;
 
 	printk(KERN_INFO "Creating spinner args %p q %p\n", sch, q);
 	q->spinner = kthread_create(qfq_spinner, (void *)sch, "qfq-spinner");
