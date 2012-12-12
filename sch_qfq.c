@@ -1126,6 +1126,25 @@ static int qfq_dump_qdisc_stats(struct Qdisc *sch, struct gnet_dump *d)
 	return gnet_stats_copy_app(d, &xstats, sizeof(xstats));
 }
 
+/*
+ * Wait until a packet is enqueued in the qdisc.
+ * We call the kernel schedule() function and check if the kthread should stop
+ * only once every few iterations of the queue length checking loop if the
+ * qdisc is idle.
+ */
+static void qfq_spinner_wait_for_skb(struct Qdisc *sch)
+{
+	int schedule_counter = 0;
+	while ((qdisc_qlen(sch) == 0) &&
+	       (schedule_counter || !kthread_should_stop())) {
+		schedule_counter++;
+		if (schedule_counter >= 10000) {
+			schedule_counter = 0;
+			schedule();
+		}
+	}
+}
+
 static int qfq_spinner(void *_qdisc)
 {
 	struct Qdisc *sch = _qdisc;
@@ -1144,17 +1163,16 @@ static int qfq_spinner(void *_qdisc)
 	printk(KERN_INFO "Kernel thread qfq-spinner on cpu %d args %p q %p\n", smp_processor_id(), sch, q);
 
 	while (!kthread_should_stop()) {
-		if (sch->q.qlen == 0) {
-			schedule();
-			continue;
-		}
+		/* Wait for a packet to be queued */
+		if (!skb)
+			qfq_spinner_wait_for_skb(sch);
+
 		local_bh_disable();
 
 		if (likely(!skb)) {
-			root_lock = qdisc_lock(sch);
-			if (!spin_trylock(root_lock))
-				goto done;
 			/* Call the real dequeue function */
+			root_lock = qdisc_lock(sch);
+			spin_lock(root_lock);
 			skb = qfq_dequeue(sch);
 			spin_unlock(root_lock);
 
