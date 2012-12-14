@@ -908,7 +908,7 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 	 * instantaneously. We just increment appropriate counters now.
 	 */
 	q->v_diff_sum += (u64)len * ONE_FP / max((u32)LINK_SPEED, q->wsum);
-	q->t_diff_sum += (u64)len * PSCHED_TICKS_PER_SEC / (125000 * max((u32)LINK_SPEED, q->wsum));
+	q->t_diff_sum += (u64)len * PSCHED_TICKS_PER_SEC / (125000 * LINK_SPEED);
 	pr_debug("qfq dequeue: len %u F %lld now %lld\n",
 		 len, (unsigned long long) cl->F, (unsigned long long) q->V);
 
