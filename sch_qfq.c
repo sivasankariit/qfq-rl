@@ -1214,6 +1214,12 @@ static void qfq_spinner_wait_for_skb(struct Qdisc *sch)
 			schedule_counter = 0;
 			schedule();
 		}
+		if (!(schedule_counter & 0x3ff)) {
+			spinlock_t *root_lock = qdisc_lock(sch);
+			spin_lock(root_lock);
+			qfq_update_system_time(qdisc_priv(sch));
+			spin_unlock(root_lock);
+		}
 	}
 }
 
