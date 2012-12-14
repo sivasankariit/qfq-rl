@@ -101,6 +101,14 @@
 #define QFQ_MTU_SHIFT		11
 #define QFQ_MIN_SLOT_SHIFT	(FRAC_BITS + QFQ_MTU_SHIFT - QFQ_MAX_INDEX)
 
+/*
+ * Link speed in Mbps. System time V will be incremented at this rate and the
+ * rate limits of flows (still using the weight variable) should be also
+ * indicated in Mbps.
+ */
+#define LINK_SPEED		10000	// 10Gbps link
+#define QFQ_DRAIN_RATE		((u64)LINK_SPEED * 125000 * ONE_FP / PSCHED_TICKS_PER_SEC)
+
 static int spin_cpu = 2;
 /* Module parameter and sysfs export */
 module_param    (spin_cpu, int, 0640);
@@ -164,6 +172,16 @@ struct qfq_sched {
 	struct qfq_group groups[QFQ_MAX_INDEX + 1]; /* The groups. */
 
 	struct task_struct *spinner;
+
+	/* real time maintenance */
+	psched_time_t	v_last_updated;	/* Time when V was last updated */
+	u64		v_diff_sum;	/* Running count of how much V should be
+					 * incremented by.
+					 */
+	u64		t_diff_sum;	/* Running count of time (in
+					 * psched_ticks) over which V should be
+					 * incremented by v_diff_sum.
+					 */
 
 	/* stats variables */
 	u64	v_forwarded;	/* V was forward to match S of some group in
@@ -765,18 +783,15 @@ static void qfq_slot_rotate(struct qfq_group *grp, u64 roundedS)
 
 static void qfq_update_eligible(struct qfq_sched *q, u64 old_V)
 {
-	struct qfq_group *grp;
 	unsigned long ineligible;
 
 	ineligible = q->bitmaps[IR] | q->bitmaps[IB];
 	if (ineligible) {
-		if (!q->bitmaps[ER]) {
-			grp = qfq_ffs(q, ineligible);
-			if (qfq_gt(grp->S, q->V)) {
-				q->V = grp->S;
-				q->v_forwarded++;
-			}
-		}
+		/*
+		 * For standard QFQ, we would first ensure V is not less
+		 * than the start time of the next ineligible group (work
+		 * conserving schedule) and update V if required.
+		 */
 		qfq_make_eligible(q, old_V);
 	} else if (!q->bitmaps[ER]) {
 		q->idle_on_deq++;
@@ -809,6 +824,50 @@ static bool qfq_update_class(struct qfq_group *grp, struct qfq_class *cl)
 	return true;
 }
 
+/* Update system time V */
+static void qfq_update_system_time(struct qfq_sched *q)
+{
+	psched_time_t now;
+	u64 t_diff;
+	u64 v_diff;
+	u64 old_V;
+
+	old_V = q->V;
+	now = psched_get_time();
+	if (q->v_last_updated == now)
+		return;
+
+	t_diff = now - q->v_last_updated;
+
+	/*
+	 * Increment V to account for transmission time of earlier dequeued
+	 * packets if required. Otherwise, just increment V based on the drain
+	 * rate of the link.
+	 */
+	if (q->t_diff_sum) {
+		if (t_diff >= q->t_diff_sum) {
+			v_diff = q->v_diff_sum;
+			t_diff -= q->t_diff_sum;
+			q->v_diff_sum = 0;
+			q->t_diff_sum = 0;
+			/* After accounting for all previously dequeued packets,
+			 * increment V at drain rate for remaining t_diff */
+			v_diff += (u64)QFQ_DRAIN_RATE * t_diff / max((u32)LINK_SPEED, q->wsum);
+		} else {
+			v_diff = q->v_diff_sum * t_diff / q->t_diff_sum;
+			q->v_diff_sum -= v_diff;
+			q->t_diff_sum -= t_diff;
+		}
+	} else
+		v_diff = (u64)QFQ_DRAIN_RATE * t_diff / max((u32)LINK_SPEED, q->wsum);
+
+	q->V += v_diff;
+	q->v_last_updated = now;
+
+	/* Update group eligibility */
+	qfq_update_eligible(q, old_V);
+}
+
 static struct sk_buff *qfq_dummy_dequeue(struct Qdisc *sch)
 {
 	qdisc_throttled(sch);
@@ -824,6 +883,8 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 	unsigned int len;
 	u64 old_V;
 
+	/* Update system time V */
+	qfq_update_system_time(q);
 	if (!q->bitmaps[ER])
 		return NULL;
 
@@ -841,7 +902,13 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 
 	old_V = q->V;
 	len = qdisc_pkt_len(skb);
-	q->V += (u64)len * IWSUM;
+	//q->V += (u64)len * ONE_FP / max((u32)LINK_SPEED, q->wsum);
+	/*
+	 * System time V will be updated over time (real time) rather than
+	 * instantaneously. We just increment appropriate counters now.
+	 */
+	q->v_diff_sum += (u64)len * ONE_FP / max((u32)LINK_SPEED, q->wsum);
+	q->t_diff_sum += (u64)len * PSCHED_TICKS_PER_SEC / (125000 * max((u32)LINK_SPEED, q->wsum));
 	pr_debug("qfq dequeue: len %u F %lld now %lld\n",
 		 len, (unsigned long long) cl->F, (unsigned long long) q->V);
 
@@ -987,8 +1054,13 @@ static void qfq_activate_class(struct qfq_sched *q, struct qfq_class *cl,
 		/* group was surely ineligible, remove */
 		__clear_bit(grp->index, &q->bitmaps[IR]);
 		__clear_bit(grp->index, &q->bitmaps[IB]);
-	} else if (!q->bitmaps[ER] && qfq_gt(roundedS, q->V))
-		q->V = roundedS;
+	}
+	/*
+	 * For standard QFQ, if the group was empty before (all slots empty) and
+	 * no other classes were [ER] then V would be lagging behind and must
+	 * be updated to make this group eligible immediately. This occurs when
+	 * the link was earlier idle and a new class needs to be activated.
+	 */
 
 	grp->S = roundedS;
 	grp->F = roundedS + (2ULL << grp->slot_shift);
@@ -1248,6 +1320,8 @@ static int qfq_init_qdisc(struct Qdisc *sch, struct nlattr *opt)
 	q->idle_on_deq = 0;
 	q->update_grp_on_deq = 0;
 	q->txq_blocked = 0;
+	q->v_diff_sum = 0;
+	q->t_diff_sum = 0;
 
 	printk(KERN_INFO "Creating spinner args %p q %p\n", sch, q);
 	q->spinner = kthread_create(qfq_spinner, (void *)sch, "qfq-spinner");
