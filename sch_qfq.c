@@ -799,8 +799,6 @@ static void qfq_update_eligible(struct qfq_sched *q, u64 old_V)
 		 * conserving schedule) and update V if required.
 		 */
 		qfq_make_eligible(q, old_V);
-	} else if (!q->bitmaps[ER]) {
-		q->idle_on_deq++;
 	}
 }
 
@@ -947,6 +945,8 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 
 skip_unblock:
 	qfq_update_eligible(q, old_V);
+	if (!qdisc_qlen(sch))
+		q->idle_on_deq++;
 
 	return skb;
 }
