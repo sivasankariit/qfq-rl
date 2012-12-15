@@ -167,6 +167,7 @@ struct qfq_sched {
 
 	u64		V;		/* Precise virtual time. */
 	u32		wsum;		/* weight sum */
+	u32		wsum_active;	/* weight sum of active classes */
 
 	unsigned long bitmaps[QFQ_MAX_STATE];	    /* Group bitmaps. */
 	struct qfq_group groups[QFQ_MAX_INDEX + 1]; /* The groups. */
@@ -400,6 +401,8 @@ static void qfq_destroy_class(struct Qdisc *sch, struct qfq_class *cl)
 
 	if (cl->inv_w) {
 		q->wsum -= ONE_FP / cl->inv_w;
+		if (qdisc_qlen(cl->qdisc))
+			q->wsum_active -= ONE_FP / cl->inv_w;
 		cl->inv_w = 0;
 	}
 
@@ -417,6 +420,9 @@ static int qfq_delete_class(struct Qdisc *sch, unsigned long arg)
 		return -EBUSY;
 
 	sch_tree_lock(sch);
+
+	if (cl->inv_w && qdisc_qlen(cl->qdisc))
+		q->wsum_active -= ONE_FP / cl->inv_w;
 
 	qfq_purge_queue(cl);
 	qdisc_class_hash_remove(&q->clhash, &cl->common);
@@ -852,14 +858,14 @@ static void qfq_update_system_time(struct qfq_sched *q)
 			q->t_diff_sum = 0;
 			/* After accounting for all previously dequeued packets,
 			 * increment V at drain rate for remaining t_diff */
-			v_diff += (u64)QFQ_DRAIN_RATE * t_diff / max((u32)LINK_SPEED, q->wsum);
+			v_diff += (u64)QFQ_DRAIN_RATE * t_diff / max((u32)LINK_SPEED, q->wsum_active);
 		} else {
 			v_diff = q->v_diff_sum * t_diff / q->t_diff_sum;
 			q->v_diff_sum -= v_diff;
 			q->t_diff_sum -= t_diff;
 		}
 	} else
-		v_diff = (u64)QFQ_DRAIN_RATE * t_diff / max((u32)LINK_SPEED, q->wsum);
+		v_diff = (u64)QFQ_DRAIN_RATE * t_diff / max((u32)LINK_SPEED, q->wsum_active);
 
 	q->V += v_diff;
 	q->v_last_updated = now;
@@ -902,12 +908,12 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 
 	old_V = q->V;
 	len = qdisc_pkt_len(skb);
-	//q->V += (u64)len * ONE_FP / max((u32)LINK_SPEED, q->wsum);
+	//q->V += (u64)len * ONE_FP / max((u32)LINK_SPEED, q->wsum_active);
 	/*
 	 * System time V will be updated over time (real time) rather than
 	 * instantaneously. We just increment appropriate counters now.
 	 */
-	q->v_diff_sum += (u64)len * ONE_FP / max((u32)LINK_SPEED, q->wsum);
+	q->v_diff_sum += (u64)len * ONE_FP / max((u32)LINK_SPEED, q->wsum_active);
 	q->t_diff_sum += (u64)len * PSCHED_TICKS_PER_SEC / (125000 * LINK_SPEED);
 	pr_debug("qfq dequeue: len %u F %lld now %lld\n",
 		 len, (unsigned long long) cl->F, (unsigned long long) q->V);
@@ -916,6 +922,8 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 		u64 old_F = grp->F;
 
 		q->update_grp_on_deq++;
+		if (cl->inv_w && !qdisc_qlen(cl->qdisc))
+			q->wsum_active -= ONE_FP / cl->inv_w;
 
 		cl = qfq_slot_scan(grp);
 		if (!cl)
@@ -934,7 +942,8 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 		}
 
 		qfq_unblock_groups(q, grp->index, old_F);
-	}
+	} else if (cl->inv_w && !qdisc_qlen(cl->qdisc))
+		q->wsum_active -= ONE_FP / cl->inv_w;
 
 skip_unblock:
 	qfq_update_eligible(q, old_V);
@@ -1016,6 +1025,8 @@ static int qfq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 
 	/* If reach this point, queue q was idle */
 	qfq_activate_class(q, cl, qdisc_pkt_len(skb));
+	if (cl->inv_w)
+		q->wsum_active += ONE_FP / cl->inv_w;
 
 	return err;
 }
