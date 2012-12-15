@@ -1205,6 +1205,7 @@ static int qfq_dump_qdisc_stats(struct Qdisc *sch, struct gnet_dump *d)
 	xstats.qdisc_stats.idle_on_deq = q->idle_on_deq;
 	xstats.qdisc_stats.update_grp_on_deq = q->update_grp_on_deq;
 	xstats.qdisc_stats.txq_blocked = q->txq_blocked;
+	xstats.qdisc_stats.wsum_active = q->wsum_active;
 
 	return gnet_stats_copy_app(d, &xstats, sizeof(xstats));
 }
