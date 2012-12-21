@@ -360,6 +360,8 @@ static int qfq_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 			need_reactivation = true;
 
 		qfq_update_class_params(q, cl, lmax, inv_w, delta_w);
+		if (cl->qdisc->q.qlen > 0)
+			q->wsum_active += delta_w;
 
 		if (need_reactivation) /* activate in new group */
 			qfq_activate_class(q, cl, qdisc_peek_len(cl->qdisc));
