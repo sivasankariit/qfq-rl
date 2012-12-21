@@ -233,6 +233,9 @@ static int qfq_calc_index(u32 inv_w, unsigned int maxlen)
 	unsigned long size_map;
 	int index = 0;
 
+	if (inv_w == ONE_FP + 1)
+		goto out;
+
 	size_map = slot_size >> QFQ_MIN_SLOT_SHIFT;
 	if (!size_map)
 		goto out;
@@ -298,14 +301,14 @@ static int qfq_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 
 	if (tb[TCA_QFQ_WEIGHT]) {
 		weight = nla_get_u32(tb[TCA_QFQ_WEIGHT]);
-		if (!weight || weight > (1UL << QFQ_MAX_WSHIFT)) {
+		if (weight > (1UL << QFQ_MAX_WSHIFT)) {
 			pr_notice("qfq: invalid weight %u\n", weight);
 			return -EINVAL;
 		}
 	} else
 		weight = 1;
 
-	inv_w = ONE_FP / weight;
+	inv_w = weight ? ONE_FP / weight : ONE_FP + 1;
 	weight = ONE_FP / inv_w;
 	delta_w = weight - (cl ? ONE_FP / cl->inv_w : 0);
 	if (q->wsum + delta_w > QFQ_MAX_WSUM) {
@@ -339,7 +342,8 @@ static int qfq_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 
 		i = qfq_calc_index(inv_w, lmax);
 		sch_tree_lock(sch);
-		if (&q->groups[i] != cl->grp && cl->qdisc->q.qlen > 0) {
+		if (&q->groups[i] != cl->grp && cl->qdisc->q.qlen > 0 &&
+		    cl->inv_w != ONE_FP + 1) {
 			/*
 			 * shift cl->F back, to not charge the
 			 * class for the not-yet-served head
@@ -348,8 +352,12 @@ static int qfq_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 			cl->F = cl->S;
 			/* remove class from its slot in the old group */
 			qfq_deactivate_class(q, cl);
-			need_reactivation = true;
+			if (inv_w != ONE_FP + 1)
+				need_reactivation = true;
 		}
+
+		if (cl->inv_w == ONE_FP + 1 && inv_w != ONE_FP + 1)
+			need_reactivation = true;
 
 		qfq_update_class_params(q, cl, lmax, inv_w, delta_w);
 
@@ -813,6 +821,8 @@ static bool qfq_update_class(struct qfq_group *grp, struct qfq_class *cl)
 	if (!len) {
 		qfq_front_slot_remove(grp);	/* queue is empty */
 		cl->idle_on_deq++;
+	} else if (cl->inv_w == ONE_FP + 1) {
+		qfq_front_slot_remove(grp);	/* weight was changed to zero */
 	} else {
 		u64 roundedS;
 
@@ -1024,9 +1034,10 @@ static int qfq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 		return err;
 
 	/* If reach this point, queue q was idle */
-	qfq_activate_class(q, cl, qdisc_pkt_len(skb));
-	if (cl->inv_w)
+	if (cl->inv_w != ONE_FP + 1) {
+		qfq_activate_class(q, cl, qdisc_pkt_len(skb));
 		q->wsum_active += ONE_FP / cl->inv_w;
+	}
 
 	return err;
 }
