@@ -1008,7 +1008,6 @@ static int qfq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 	struct qfq_sched *q = qdisc_priv(sch);
 	struct qfq_class *cl;
 	int err = 0;
-
 	cl = qfq_classify(skb, sch, &err);
 	if (cl == NULL) {
 		if (err & __NET_XMIT_BYPASS)
@@ -1042,6 +1041,18 @@ static int qfq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 	}
 
 	return err;
+}
+
+static int qfq_enqueue_safe(struct sk_buff *skb, struct Qdisc *sch)
+{
+	int rc;
+	spinlock_t *root_lock = qdisc_lock(sch);
+
+	spin_lock(root_lock);
+	rc = qfq_enqueue(skb, sch);
+	spin_unlock(root_lock);
+
+	return rc;
 }
 
 /*
@@ -1354,6 +1365,8 @@ static int qfq_init_qdisc(struct Qdisc *sch, struct nlattr *opt)
 	q->v_diff_sum = 0;
 	q->t_diff_sum = 0;
 
+	sch->flags |= TCQ_F_QFQ_RL;
+
 	printk(KERN_INFO "Creating spinner args %p q %p\n", sch, q);
 	q->spinner = kthread_create(qfq_spinner, (void *)sch, "qfq-spinner");
 
@@ -1435,7 +1448,7 @@ static struct Qdisc_ops qfq_qdisc_ops __read_mostly = {
 	.cl_ops		= &qfq_class_ops,
 	.id		= "qfq",
 	.priv_size	= sizeof(struct qfq_sched),
-	.enqueue	= qfq_enqueue,
+	.enqueue	= qfq_enqueue_safe,
 	/*.dequeue	= qfq_dequeue, */
 	.dequeue        = qfq_dummy_dequeue,
 	.peek		= qdisc_peek_dequeued,
