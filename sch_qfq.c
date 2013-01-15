@@ -196,6 +196,29 @@ struct qfq_sched {
 			      * we increment this value at most once (not for
 			      * each time we retry).
 			      */
+
+	/* Per CPU locking and queues */
+	unsigned long work_bitmap; /* Indicates scheduled work on different
+				    * CPUs. Bit i is set if CPU i has
+				    * scheduled activation work.
+				    */
+	struct qfq_cpu_work_queue __percpu *work_queue; /* Per CPU work queues
+							 * which indicate that
+							 * some classes have to
+							 * be activated on this
+							 * CPU.
+							 */
+};
+
+struct qfq_cpu_work_queue {
+	struct list_head list; /* Head of the work queue */
+	spinlock_t lock;
+};
+
+struct qfq_cpu_work_entry {
+	struct qfq_class *cl; /* Class that has to be activated */
+	unsigned int pkt_len; /* Length of enqueued packet */
+	struct list_head list;
 };
 
 static struct qfq_class *qfq_find_class(struct Qdisc *sch, u32 classid)
@@ -817,7 +840,21 @@ static void qfq_update_eligible(struct qfq_sched *q, u64 old_V)
  */
 static bool qfq_update_class(struct qfq_group *grp, struct qfq_class *cl)
 {
-	unsigned int len = qdisc_peek_len(cl->qdisc);
+	/* FIXME(siva): I think the class lock is needed here only for peeking
+	 * at the length of the first packet in cl->qdisc. We might be able to
+	 * first check if there is a packet using the length of the class qdisc
+	 * (known at dequeue time) and peek for the length of the next packet
+	 * also immediately if there is any packet in the qdisc. That would let
+	 * us avoid locking the qdisc again here.
+	 * As for writing to other class variables such as S and F, we only
+	 * update those from the dequeue thread and the enqueue operation only
+	 * makes changes to the class qdisc.
+	 */
+	spinlock_t *class_lock= qdisc_lock(cl->qdisc);
+	unsigned int len;
+
+	spin_lock(class_lock);
+	len = qdisc_peek_len(cl->qdisc);
 
 	cl->S = cl->F;
 	if (!len) {
@@ -830,12 +867,15 @@ static bool qfq_update_class(struct qfq_group *grp, struct qfq_class *cl)
 
 		cl->F = cl->S + (u64)len * cl->inv_w;
 		roundedS = qfq_round_down(cl->S, grp->slot_shift);
-		if (roundedS == grp->S)
+		if (roundedS == grp->S) {
+			spin_unlock(class_lock);
 			return false;
+		}
 
 		qfq_front_slot_remove(grp);
 		qfq_slot_insert(grp, cl, roundedS);
 	}
+	spin_unlock(class_lock);
 
 	return true;
 }
@@ -897,6 +937,8 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 	struct qfq_class *cl;
 	struct sk_buff *skb;
 	unsigned int len;
+	int cl_qlen;
+	spinlock_t *class_lock;
 	u64 old_V;
 
 	/* Update system time V */
@@ -907,13 +949,22 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 	grp = qfq_ffs(q, q->bitmaps[ER]);
 
 	cl = qfq_slot_head(grp);
+	class_lock = qdisc_lock(cl->qdisc);
+	spin_lock(class_lock);
 	skb = qdisc_dequeue_peeked(cl->qdisc);
+	cl_qlen = qdisc_qlen(cl->qdisc);
+	spin_unlock(class_lock);
 	if (!skb) {
 		WARN_ONCE(1, "qfq_dequeue: non-workconserving leaf\n");
 		return NULL;
 	}
 
-	sch->q.qlen--;
+	/* sch->q.qlen for the QFQ-RL qdisc now denotes the number of activated
+	 * classes. This value is only updated in the dequeue thread.
+	 */
+	if (!cl_qlen)
+		sch->q.qlen--;
+
 	qdisc_bstats_update(sch, skb);
 
 	old_V = q->V;
@@ -932,7 +983,7 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 		u64 old_F = grp->F;
 
 		q->update_grp_on_deq++;
-		if (cl->inv_w && !qdisc_qlen(cl->qdisc))
+		if (cl->inv_w && !cl_qlen)
 			q->wsum_active -= ONE_FP / cl->inv_w;
 
 		cl = qfq_slot_scan(grp);
@@ -952,7 +1003,7 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 		}
 
 		qfq_unblock_groups(q, grp->index, old_F);
-	} else if (cl->inv_w && !qdisc_qlen(cl->qdisc))
+	} else if (cl->inv_w && !cl_qlen)
 		q->wsum_active -= ONE_FP / cl->inv_w;
 
 skip_unblock:
@@ -1003,10 +1054,36 @@ static void qfq_update_start(struct qfq_sched *q, struct qfq_class *cl)
 		cl->S = cl->F;
 }
 
+static void qfq_enqueue_work_entry(struct qfq_sched *q, struct qfq_class *cl,
+				   unsigned int pkt_len)
+{
+	struct qfq_cpu_work_queue *work_queue = this_cpu_ptr(q->work_queue);
+	struct qfq_cpu_work_entry *ent = kzalloc(sizeof(*ent), GFP_ATOMIC);
+	unsigned int cpu;
+	if (ent == NULL) {
+		printk("qfq_enqueue: FIX FIX FIX -- Work entry creation failed."
+		       " Class not activated. This can cause problems.\n");
+		return;
+	}
+
+	ent->cl = cl;
+	ent->pkt_len = pkt_len;
+	smp_mb();
+
+	spin_lock(&work_queue->lock);
+	list_add_tail(&ent->list, &work_queue->list);
+	spin_unlock(&work_queue->lock);
+
+	cpu = smp_processor_id();
+	set_bit(cpu, &q->work_bitmap);
+}
+
 static int qfq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 {
 	struct qfq_sched *q = qdisc_priv(sch);
 	struct qfq_class *cl;
+	spinlock_t *class_lock;
+	int cl_qlen = 0;
 	int err = 0;
 	cl = qfq_classify(skb, sch, &err);
 	if (cl == NULL) {
@@ -1017,7 +1094,12 @@ static int qfq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 	}
 	pr_debug("qfq_enqueue: cl = %x\n", cl->common.classid);
 
+	class_lock = qdisc_lock(cl->qdisc);
+	spin_lock(class_lock);
 	err = qdisc_enqueue(skb, cl->qdisc);
+	cl_qlen = qdisc_qlen(cl->qdisc);
+	spin_unlock(class_lock);
+
 	if (unlikely(err != NET_XMIT_SUCCESS)) {
 		pr_debug("qfq_enqueue: enqueue failed %d\n", err);
 		if (net_xmit_drop_count(err)) {
@@ -1028,16 +1110,17 @@ static int qfq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 	}
 
 	bstats_update(&cl->bstats, skb);
-	++sch->q.qlen;
+	//++sch->q.qlen;
 
 	/* If the new skb is not the head of queue, then done here. */
-	if (cl->qdisc->q.qlen != 1)
+	if (cl_qlen != 1)
 		return err;
 
 	/* If reach this point, queue q was idle */
 	if (cl->inv_w != ONE_FP + 1) {
-		qfq_activate_class(q, cl, qdisc_pkt_len(skb));
-		q->wsum_active += ONE_FP / cl->inv_w;
+		qfq_enqueue_work_entry(q, cl, qdisc_pkt_len(skb));
+		//qfq_activate_class(q, cl, qdisc_pkt_len(skb));
+		//q->wsum_active += ONE_FP / cl->inv_w;
 	}
 
 	return err;
@@ -1242,9 +1325,11 @@ static int qfq_dump_qdisc_stats(struct Qdisc *sch, struct gnet_dump *d)
  */
 static void qfq_spinner_wait_for_skb(struct Qdisc *sch)
 {
+	struct qfq_sched *q = qdisc_priv(sch);
 	int schedule_counter = 0;
 	while ((qdisc_qlen(sch) == 0) &&
-	       (schedule_counter || !kthread_should_stop())) {
+	       (schedule_counter || !kthread_should_stop()) &&
+	       (!q->work_bitmap)) {
 		schedule_counter++;
 		if (schedule_counter >= 10000) {
 			schedule_counter = 0;
@@ -1257,6 +1342,50 @@ static void qfq_spinner_wait_for_skb(struct Qdisc *sch)
 			spin_unlock(root_lock);
 		}
 	}
+}
+
+static void qfq_spinner_activate_classes(struct Qdisc *sch)
+{
+	struct qfq_sched *q = qdisc_priv(sch);
+	spinlock_t *root_lock = qdisc_lock(sch);
+	unsigned int cpu;
+
+	/* We just check the work bitmap without atomicity to see if there is
+	 * any  work at all. Even if it is incorrect, we would eventually read
+	 * the correct values in another iteration.
+	 */
+	if (!q->work_bitmap)
+		return;
+
+	local_bh_disable();
+	spin_lock(root_lock);
+	for_each_possible_cpu(cpu) {
+		struct qfq_cpu_work_queue *work_queue;
+		struct qfq_cpu_work_entry *ent, *tmp_ent;
+
+		if (!test_and_clear_bit(cpu, &q->work_bitmap))
+			continue;
+
+		/* Process all class activation requests for the CPU */
+		work_queue = per_cpu_ptr(q->work_queue, cpu);
+		spin_lock(&work_queue->lock);
+		list_for_each_entry_safe(ent, tmp_ent, &work_queue->list, list) {
+			spinlock_t *class_lock;
+			list_del(&ent->list);
+			// FIXME(siva): class lock is probably not
+			// required here since we do not update the class qdisc.
+			class_lock = qdisc_lock(ent->cl->qdisc);
+			spin_lock(class_lock);
+			qfq_activate_class(q, ent->cl, ent->pkt_len);
+			spin_unlock(class_lock);
+			q->wsum_active += ONE_FP / ent->cl->inv_w;
+			++sch->q.qlen;
+			kfree(ent);
+		}
+		spin_unlock(&work_queue->lock);
+	}
+	spin_unlock(root_lock);
+	local_bh_enable();
 }
 
 static int qfq_spinner(void *_qdisc)
@@ -1277,9 +1406,12 @@ static int qfq_spinner(void *_qdisc)
 	printk(KERN_INFO "Kernel thread qfq-spinner on cpu %d args %p q %p\n", smp_processor_id(), sch, q);
 
 	while (!kthread_should_stop()) {
-		/* Wait for a packet to be queued */
+		/* Wait for a packet to be queued*/
 		if (!skb)
 			qfq_spinner_wait_for_skb(sch);
+
+		/* Perform work items enqueued by CPUs */
+		qfq_spinner_activate_classes(sch);
 
 		local_bh_disable();
 
@@ -1344,6 +1476,7 @@ static int qfq_init_qdisc(struct Qdisc *sch, struct nlattr *opt)
 	struct qfq_sched *q = qdisc_priv(sch);
 	struct qfq_group *grp;
 	int i, j, err;
+	unsigned int cpu;
 
 	err = qdisc_class_hash_init(&q->clhash);
 	if (err < 0)
@@ -1364,6 +1497,15 @@ static int qfq_init_qdisc(struct Qdisc *sch, struct nlattr *opt)
 	q->txq_blocked = 0;
 	q->v_diff_sum = 0;
 	q->t_diff_sum = 0;
+
+	/* Allocate and initialize per CPU work queues */
+	q->work_queue = alloc_percpu(struct qfq_cpu_work_queue);
+	q->work_bitmap = 0;
+	for_each_possible_cpu(cpu) {
+		struct qfq_cpu_work_queue *work_queue = per_cpu_ptr(q->work_queue, cpu);
+		INIT_LIST_HEAD(&work_queue->list);
+		spin_lock_init(&work_queue->lock);
+	}
 
 	sch->flags |= TCQ_F_QFQ_RL;
 
@@ -1387,6 +1529,7 @@ static void qfq_reset_qdisc(struct Qdisc *sch)
 	struct qfq_class *cl;
 	struct hlist_node *n, *tmp;
 	unsigned int i, j;
+	unsigned int cpu;
 
 	for (i = 0; i <= QFQ_MAX_INDEX; i++) {
 		grp = &q->groups[i];
@@ -1403,6 +1546,20 @@ static void qfq_reset_qdisc(struct Qdisc *sch)
 			qdisc_reset(cl->qdisc);
 	}
 	sch->q.qlen = 0;
+
+	for_each_possible_cpu(cpu) {
+		struct qfq_cpu_work_queue *work_queue;
+		struct qfq_cpu_work_entry *ent, *tmp_ent;
+
+		work_queue = per_cpu_ptr(q->work_queue, cpu);
+		spin_lock(&work_queue->lock);
+		list_for_each_entry_safe(ent, tmp_ent, &work_queue->list, list) {
+			list_del(&ent->list);
+			kfree(ent);
+		}
+		spin_unlock(&work_queue->lock);
+	}
+	q->work_bitmap = 0;
 }
 
 static void qfq_destroy_qdisc(struct Qdisc *sch)
@@ -1411,6 +1568,7 @@ static void qfq_destroy_qdisc(struct Qdisc *sch)
 	struct qfq_class *cl;
 	struct hlist_node *n, *next;
 	unsigned int i;
+	unsigned int cpu;
 
 	printk(KERN_INFO "waiting for thread %p to stop\n", q->spinner);
 	if (!IS_ERR(q->spinner)) {
@@ -1426,6 +1584,23 @@ static void qfq_destroy_qdisc(struct Qdisc *sch)
 		}
 	}
 	qdisc_class_hash_destroy(&q->clhash);
+
+	/* Free the CPU work queues */
+	for_each_possible_cpu(cpu) {
+		struct qfq_cpu_work_queue *work_queue;
+		struct qfq_cpu_work_entry *ent, *tmp_ent;
+
+		work_queue = per_cpu_ptr(q->work_queue, cpu);
+		spin_lock(&work_queue->lock);
+		list_for_each_entry_safe(ent, tmp_ent, &work_queue->list, list) {
+			list_del(&ent->list);
+			kfree(ent);
+		}
+		spin_unlock(&work_queue->lock);
+	}
+	free_percpu(q->work_queue);
+	q->work_queue = NULL;
+	q->work_bitmap = 0;
 }
 
 static const struct Qdisc_class_ops qfq_class_ops = {
@@ -1448,7 +1623,7 @@ static struct Qdisc_ops qfq_qdisc_ops __read_mostly = {
 	.cl_ops		= &qfq_class_ops,
 	.id		= "qfq",
 	.priv_size	= sizeof(struct qfq_sched),
-	.enqueue	= qfq_enqueue_safe,
+	.enqueue	= qfq_enqueue,
 	/*.dequeue	= qfq_dequeue, */
 	.dequeue        = qfq_dummy_dequeue,
 	.peek		= qdisc_peek_dequeued,
