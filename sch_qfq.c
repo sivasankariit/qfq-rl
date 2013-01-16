@@ -1332,12 +1332,6 @@ static void qfq_spinner_wait_for_skb(struct Qdisc *sch)
 			schedule_counter = 0;
 			schedule();
 		}
-		if (!(schedule_counter & 0x3ff)) {
-			spinlock_t *root_lock = qdisc_lock(sch);
-			spin_lock(root_lock);
-			qfq_update_system_time(qdisc_priv(sch));
-			spin_unlock(root_lock);
-		}
 	}
 }
 
@@ -1354,8 +1348,8 @@ static void qfq_spinner_activate_classes(struct Qdisc *sch)
 	if (!q->work_bitmap)
 		return;
 
-	local_bh_disable();
 	spin_lock(root_lock);
+	qfq_update_system_time(qdisc_priv(sch));
 	for_each_possible_cpu(cpu) {
 		struct qfq_cpu_work_queue *work_queue;
 		struct qfq_cpu_work_entry *ent, *tmp_ent;
@@ -1379,7 +1373,6 @@ static void qfq_spinner_activate_classes(struct Qdisc *sch)
 		spin_unlock(&work_queue->lock);
 	}
 	spin_unlock(root_lock);
-	local_bh_enable();
 }
 
 static int qfq_spinner(void *_qdisc)
