@@ -1367,14 +1367,11 @@ static void qfq_spinner_activate_classes(struct Qdisc *sch)
 		work_queue = per_cpu_ptr(q->work_queue, cpu);
 		spin_lock(&work_queue->lock);
 		list_for_each_entry_safe(ent, tmp_ent, &work_queue->list, list) {
-			spinlock_t *class_lock;
 			list_del(&ent->list);
-			// FIXME(siva): class lock is probably not
-			// required here since we do not update the class qdisc.
-			class_lock = qdisc_lock(ent->cl->qdisc);
-			spin_lock(class_lock);
+			/* We do not acquire the class lock here since we only activate the
+             * class and do not update the class qdisc.
+             */
 			qfq_activate_class(q, ent->cl, ent->pkt_len);
-			spin_unlock(class_lock);
 			q->wsum_active += ONE_FP / ent->cl->inv_w;
 			++sch->q.qlen;
 			kfree(ent);
