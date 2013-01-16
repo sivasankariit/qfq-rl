@@ -838,23 +838,14 @@ static void qfq_update_eligible(struct qfq_sched *q, u64 old_V)
 /*
  * Updates the class, returns true if also the group needs to be updated.
  */
-static bool qfq_update_class(struct qfq_group *grp, struct qfq_class *cl)
+static bool qfq_update_class(struct qfq_group *grp, struct qfq_class *cl,
+			     unsigned int len)
 {
-	/* FIXME(siva): I think the class lock is needed here only for peeking
-	 * at the length of the first packet in cl->qdisc. We might be able to
-	 * first check if there is a packet using the length of the class qdisc
-	 * (known at dequeue time) and peek for the length of the next packet
-	 * also immediately if there is any packet in the qdisc. That would let
-	 * us avoid locking the qdisc again here.
-	 * As for writing to other class variables such as S and F, we only
-	 * update those from the dequeue thread and the enqueue operation only
-	 * makes changes to the class qdisc.
+	/* We do not hold the class lock while updating class variables such as
+	 * S and F here. These variables are only updated from the dequeue
+	 * thread and the enqueue operation only makes changes to the class
+	 * qdisc.
 	 */
-	spinlock_t *class_lock= qdisc_lock(cl->qdisc);
-	unsigned int len;
-
-	spin_lock(class_lock);
-	len = qdisc_peek_len(cl->qdisc);
 
 	cl->S = cl->F;
 	if (!len) {
@@ -867,15 +858,12 @@ static bool qfq_update_class(struct qfq_group *grp, struct qfq_class *cl)
 
 		cl->F = cl->S + (u64)len * cl->inv_w;
 		roundedS = qfq_round_down(cl->S, grp->slot_shift);
-		if (roundedS == grp->S) {
-			spin_unlock(class_lock);
+		if (roundedS == grp->S)
 			return false;
-		}
 
 		qfq_front_slot_remove(grp);
 		qfq_slot_insert(grp, cl, roundedS);
 	}
-	spin_unlock(class_lock);
 
 	return true;
 }
@@ -937,6 +925,7 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 	struct qfq_class *cl;
 	struct sk_buff *skb;
 	unsigned int len;
+	unsigned int next_len = 0;
 	int cl_qlen;
 	spinlock_t *class_lock;
 	u64 old_V;
@@ -953,7 +942,10 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 	spin_lock(class_lock);
 	skb = qdisc_dequeue_peeked(cl->qdisc);
 	cl_qlen = qdisc_qlen(cl->qdisc);
+	if (skb && cl_qlen)
+		next_len = qdisc_peek_len(cl->qdisc);
 	spin_unlock(class_lock);
+
 	if (!skb) {
 		WARN_ONCE(1, "qfq_dequeue: non-workconserving leaf\n");
 		return NULL;
@@ -979,7 +971,7 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 	pr_debug("qfq dequeue: len %u F %lld now %lld\n",
 		 len, (unsigned long long) cl->F, (unsigned long long) q->V);
 
-	if (qfq_update_class(grp, cl)) {
+	if (qfq_update_class(grp, cl, next_len)) {
 		u64 old_F = grp->F;
 
 		q->update_grp_on_deq++;
@@ -1103,12 +1095,17 @@ static int qfq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 	if (unlikely(err != NET_XMIT_SUCCESS)) {
 		pr_debug("qfq_enqueue: enqueue failed %d\n", err);
 		if (net_xmit_drop_count(err)) {
+			/* FIXME(siva): Class stats should be updated while
+			 * holding the class lock. The QFQ qdisc needs other
+			 * techniques for synchronization.
+			 */
 			cl->qstats.drops++;
 			sch->qstats.drops++;
 		}
 		return err;
 	}
 
+	/* FIXME(siva): bstats are being updated without the class lock. */
 	bstats_update(&cl->bstats, skb);
 	//++sch->q.qlen;
 
