@@ -107,7 +107,7 @@
  * indicated in Mbps.
  */
 #define LINK_SPEED		10000	// 10Gbps link
-#define QFQ_DRAIN_RATE		((u64)LINK_SPEED * 125000 * ONE_FP / PSCHED_TICKS_PER_SEC)
+#define QFQ_DRAIN_RATE		((u64)LINK_SPEED * 125000 * ONE_FP / NSEC_PER_SEC)
 
 static int spin_cpu = 2;
 /* Module parameter and sysfs export */
@@ -148,6 +148,8 @@ struct qfq_class {
 
 	/* stats variables */
 	u64 idle_on_deq; /* Class was idle after a dequeue from this class */
+	s64 prev_dequeue_time_ns;
+	s64 inter_dequeue_time_ns;
 };
 
 struct qfq_group {
@@ -175,7 +177,7 @@ struct qfq_sched {
 	struct task_struct *spinner;
 
 	/* real time maintenance */
-	psched_time_t	v_last_updated;	/* Time when V was last updated */
+	u64		v_last_updated;	/* Time when V was last updated */
 	u64		v_diff_sum;	/* Running count of how much V should be
 					 * incremented by.
 					 */
@@ -418,6 +420,9 @@ static int qfq_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 		}
 	}
 
+	cl->prev_dequeue_time_ns = ktime_get().tv64;
+	cl->inter_dequeue_time_ns = 0;
+
 	sch_tree_lock(sch);
 	qdisc_class_hash_insert(&q->clhash, &cl->common);
 	sch_tree_unlock(sch);
@@ -559,6 +564,7 @@ static int qfq_dump_class(struct Qdisc *sch, unsigned long arg,
 	if (nla_put_u32(skb, TCA_QFQ_WEIGHT, ONE_FP/cl->inv_w) ||
 	    nla_put_u32(skb, TCA_QFQ_LMAX, cl->lmax))
 		goto nla_put_failure;
+
 	return nla_nest_end(skb, nest);
 
 nla_put_failure:
@@ -575,6 +581,7 @@ static int qfq_dump_class_stats(struct Qdisc *sch, unsigned long arg,
 	xstats.class_stats.idle_on_deq = cl->idle_on_deq;
 
 	cl->qdisc->qstats.qlen = cl->qdisc->q.qlen;
+	printk(KERN_INFO "class %p inter_dequeue_time %lld\n", cl, cl->inter_dequeue_time_ns);
 
 	if (gnet_stats_copy_basic(d, &cl->bstats) < 0 ||
 	    gnet_stats_copy_rate_est(d, &cl->bstats, &cl->rate_est) < 0 ||
@@ -871,13 +878,13 @@ static bool qfq_update_class(struct qfq_group *grp, struct qfq_class *cl,
 /* Update system time V */
 static void qfq_update_system_time(struct qfq_sched *q)
 {
-	psched_time_t now;
+	u64 now;
 	u64 t_diff;
 	u64 v_diff;
 	u64 old_V;
 
 	old_V = q->V;
-	now = psched_get_time();
+	now = ktime_get().tv64;
 	if (q->v_last_updated == now)
 		return;
 
@@ -942,8 +949,14 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 	spin_lock(class_lock);
 	skb = qdisc_dequeue_peeked(cl->qdisc);
 	cl_qlen = qdisc_qlen(cl->qdisc);
-	if (skb && cl_qlen)
+	if (skb && cl_qlen) {
+		s64 now = ktime_get().tv64;
+		s64 dt = now - cl->prev_dequeue_time_ns;
+		cl->prev_dequeue_time_ns = now;
+		/* Calculate EWMA */
+		cl->inter_dequeue_time_ns = ((cl->inter_dequeue_time_ns * 7) + dt) >> 3;
 		next_len = qdisc_peek_len(cl->qdisc);
+	}
 	spin_unlock(class_lock);
 
 	if (!skb) {
@@ -967,7 +980,7 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 	 * instantaneously. We just increment appropriate counters now.
 	 */
 	q->v_diff_sum += (u64)len * ONE_FP / max((u32)LINK_SPEED, q->wsum_active);
-	q->t_diff_sum += (u64)len * PSCHED_TICKS_PER_SEC / (125000 * LINK_SPEED);
+	q->t_diff_sum += (u64)len * NSEC_PER_SEC / (125000 * LINK_SPEED);
 	pr_debug("qfq dequeue: len %u F %lld now %lld\n",
 		 len, (unsigned long long) cl->F, (unsigned long long) q->V);
 
