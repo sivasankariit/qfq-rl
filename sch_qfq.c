@@ -22,6 +22,7 @@
 #include <linux/kernel.h>
 #include <linux/sched.h>
 #include <linux/kthread.h>
+#include <net/sock.h>
 
 /*  Quick Fair Queueing
     ===================
@@ -623,6 +624,11 @@ static struct qfq_class *qfq_classify(struct sk_buff *skb, struct Qdisc *sch,
 	struct qfq_class *cl;
 	struct tcf_result res;
 	int result;
+	int need_reclassify = 0;
+
+	if (likely(!need_reclassify && skb->sk && skb->sk->sk_security)) {
+		return skb->sk->sk_security;
+	}
 
 	if (TC_H_MAJ(skb->priority ^ sch->handle) == 0) {
 		pr_debug("qfq_classify: found %d\n", skb->priority);
@@ -1097,6 +1103,10 @@ static int qfq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 		kfree_skb(skb);
 		return err;
 	}
+
+	if (skb->sk)
+		skb->sk->sk_security = cl;
+
 	pr_debug("qfq_enqueue: cl = %x\n", cl->common.classid);
 
 	class_lock = qdisc_lock(cl->qdisc);
