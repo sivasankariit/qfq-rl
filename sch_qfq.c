@@ -1440,10 +1440,10 @@ static int qfq_spinner(void *_qdisc)
 		if (!skb)
 			qfq_spinner_wait_for_skb(sch);
 
+		local_bh_disable();
+
 		/* Perform work items enqueued by CPUs */
 		qfq_spinner_activate_classes(sch);
-
-		local_bh_disable();
 
 		if (likely(!skb)) {
 			/* Call the real dequeue function */
