@@ -582,7 +582,7 @@ static int qfq_dump_class_stats(struct Qdisc *sch, unsigned long arg,
 	xstats.class_stats.idle_on_deq = cl->idle_on_deq;
 
 	cl->qdisc->qstats.qlen = cl->qdisc->q.qlen;
-	printk(KERN_INFO "class %p inter_dequeue_time %lld\n", cl, cl->inter_dequeue_time_ns);
+	//printk(KERN_INFO "class %p inter_dequeue_time %lld\n", cl, cl->inter_dequeue_time_ns);
 
 	if (gnet_stats_copy_basic(d, &cl->bstats) < 0 ||
 	    gnet_stats_copy_rate_est(d, &cl->bstats, &cl->rate_est) < 0 ||
@@ -768,6 +768,21 @@ static void qfq_slot_insert(struct qfq_group *grp, struct qfq_class *cl,
 	u64 slot = (roundedS - grp->S) >> grp->slot_shift;
 	unsigned int i = (grp->front + slot) % QFQ_MAX_SLOTS;
 
+	if (unlikely(slot >= QFQ_MAX_SLOTS)) {
+		printk_ratelimited(KERN_INFO "slot_insert slot %llu "
+				   "roundedS %llu "
+				   "cl->S %llu "
+				   "grp->S %llu "
+				   "grp->slot_shift %u "
+				   "grp->full_slots = 0x%lx "
+				   "grp->front %u "
+				   "grp->idx %u\n",
+				   slot, roundedS, cl->S, grp->S,
+				   grp->slot_shift, grp->full_slots,
+				   grp->front, grp->index);
+		slot = QFQ_MAX_SLOTS - 1;
+		i = (grp->front + slot) % QFQ_MAX_SLOTS;
+	}
 	hlist_add_head(&cl->next, &grp->slots[i]);
 	__set_bit(slot, &grp->full_slots);
 }
@@ -886,7 +901,7 @@ static void qfq_update_system_time(struct qfq_sched *q)
 {
 	u64 now;
 	u64 t_diff;
-	u64 v_diff;
+	u64 v_diff = 0;
 	u64 old_V;
 
 	old_V = q->V;
@@ -908,15 +923,20 @@ static void qfq_update_system_time(struct qfq_sched *q)
 			q->v_diff_sum = 0;
 			q->t_diff_sum = 0;
 			/* After accounting for all previously dequeued packets,
-			 * increment V at drain rate for remaining t_diff */
-			v_diff += (u64)QFQ_DRAIN_RATE * t_diff / max((u32)LINK_SPEED, q->wsum_active);
+			 * increment V at drain rate for remaining t_diff.
+			 * Only do this if there aren't any eligible and ready
+			 * groups currently. */
+			if (!q->bitmaps[ER])
+				v_diff += (u64)QFQ_DRAIN_RATE * t_diff / max((u32)LINK_SPEED, q->wsum_active);
 		} else {
 			v_diff = q->v_diff_sum * t_diff / q->t_diff_sum;
 			q->v_diff_sum -= v_diff;
 			q->t_diff_sum -= t_diff;
 		}
-	} else
+	} else if (!q->bitmaps[ER]) {
+		/* Increment V at line rate if no group is eligible and ready */
 		v_diff = (u64)QFQ_DRAIN_RATE * t_diff / max((u32)LINK_SPEED, q->wsum_active);
+	}
 
 	q->V += v_diff;
 	q->v_last_updated = now;
@@ -1386,8 +1406,8 @@ static void qfq_spinner_activate_classes(struct Qdisc *sch)
 		list_for_each_entry_safe(ent, tmp_ent, &work_queue->list, list) {
 			list_del(&ent->list);
 			/* We do not acquire the class lock here since we only activate the
-             * class and do not update the class qdisc.
-             */
+			 * class and do not update the class qdisc.
+			 */
 			qfq_activate_class(q, ent->cl, ent->pkt_len);
 			q->wsum_active += ONE_FP / ent->cl->inv_w;
 			++sch->q.qlen;
