@@ -624,10 +624,9 @@ static struct qfq_class *qfq_classify(struct sk_buff *skb, struct Qdisc *sch,
 	struct qfq_class *cl;
 	struct tcf_result res;
 	int result;
-	int need_reclassify = 0;
 
-	if (likely(!need_reclassify && skb->sk && skb->sk->sk_security)) {
-		return skb->sk->sk_security;
+	if (likely(skb->sk && skb->sk->qdisc_cache == sch && skb->sk->cl_cache)) {
+		return skb->sk->cl_cache;
 	}
 
 	if (TC_H_MAJ(skb->priority ^ sch->handle) == 0) {
@@ -1124,8 +1123,10 @@ static int qfq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 		return err;
 	}
 
-	if (skb->sk)
-		skb->sk->sk_security = cl;
+	if (skb->sk) {
+		skb->sk->qdisc_cache = (void *)sch;
+		skb->sk->cl_cache = (void *)cl;
+	}
 
 	pr_debug("qfq_enqueue: cl = %x\n", cl->common.classid);
 
