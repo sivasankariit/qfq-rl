@@ -151,6 +151,9 @@ struct qfq_class {
 	u64 idle_on_deq; /* Class was idle after a dequeue from this class */
 	s64 prev_dequeue_time_ns;
 	s64 inter_dequeue_time_ns;
+
+	s64 expected_inter_dequeue_time_ns;
+	s64 absdev_dequeue_time_ns;
 };
 
 struct qfq_group {
@@ -424,6 +427,9 @@ static int qfq_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 	cl->prev_dequeue_time_ns = ktime_get().tv64;
 	cl->inter_dequeue_time_ns = 0;
 
+	cl->expected_inter_dequeue_time_ns = 1482LLU * 8 * 1000 / weight;
+	cl->absdev_dequeue_time_ns = 0;
+
 	sch_tree_lock(sch);
 	qdisc_class_hash_insert(&q->clhash, &cl->common);
 	sch_tree_unlock(sch);
@@ -581,6 +587,8 @@ static int qfq_dump_class_stats(struct Qdisc *sch, unsigned long arg,
 
 	xstats.class_stats.idle_on_deq = cl->idle_on_deq;
 	xstats.class_stats.inter_deq_time_ns = cl->inter_dequeue_time_ns;
+	xstats.class_stats.absdev_deq_time_ns = cl->absdev_dequeue_time_ns;
+	xstats.class_stats.expected_inter_dequeue_time_ns = cl->expected_inter_dequeue_time_ns;
 
 	cl->qdisc->qstats.qlen = cl->qdisc->q.qlen;
 	//printk(KERN_INFO "class %p inter_dequeue_time %lld\n", cl, cl->inter_dequeue_time_ns);
@@ -978,9 +986,12 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 	if (skb && cl_qlen) {
 		s64 now = ktime_get().tv64;
 		s64 dt = now - cl->prev_dequeue_time_ns;
+		s64 dev = dt - cl->expected_inter_dequeue_time_ns;
+		if (dev < 0) dev = -dev;
 		cl->prev_dequeue_time_ns = now;
 		/* Calculate EWMA */
 		cl->inter_dequeue_time_ns = ((cl->inter_dequeue_time_ns * 7) + dt) >> 3;
+		cl->absdev_dequeue_time_ns = ((cl->absdev_dequeue_time_ns * 7) + dev) >> 3;
 		next_len = qdisc_peek_len(cl->qdisc);
 	}
 	spin_unlock(class_lock);
