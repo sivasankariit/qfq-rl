@@ -580,6 +580,7 @@ static int qfq_dump_class_stats(struct Qdisc *sch, unsigned long arg,
 	struct tc_qfq_xstats xstats = {.type = TCA_QFQ_XSTATS_CLASS};
 
 	xstats.class_stats.idle_on_deq = cl->idle_on_deq;
+	xstats.class_stats.inter_deq_time_ns = cl->inter_dequeue_time_ns;
 
 	cl->qdisc->qstats.qlen = cl->qdisc->q.qlen;
 	//printk(KERN_INFO "class %p inter_dequeue_time %lld\n", cl, cl->inter_dequeue_time_ns);
