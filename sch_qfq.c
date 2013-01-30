@@ -106,8 +106,16 @@
  * Link speed in Mbps. System time V will be incremented at this rate and the
  * rate limits of flows (still using the weight variable) should be also
  * indicated in Mbps.
+ *
+ * This value should actually be about 9844Mb/s but we leave it at
+ * 9800 with the hope of having small queues in the NIC.  The reason
+ * is that with a given MTU, each packet has an Ethernet preamble (4B)
+ * and the frame check sequence (8B) and a minimum recommended
+ * inter-packet gap (0.0096us for 10GbE = 12B).  Thus the max
+ * achievable data rate is MTU / (MTU + 24), which is 0.98439 with MTU
+ * = 1500B and and 0.99734 with MTU=9000B.
  */
-#define LINK_SPEED		10000	// 10Gbps link
+#define LINK_SPEED		9800	// 10Gbps link
 #define QFQ_DRAIN_RATE		((u64)LINK_SPEED * 125000 * ONE_FP / NSEC_PER_SEC)
 
 static int spin_cpu = 2;
