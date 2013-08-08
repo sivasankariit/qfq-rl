@@ -777,24 +777,33 @@ static void qfq_make_eligible(struct qfq_sched *q, u64 old_V)
  * This is guaranteed by the input values.
  * roundedS is always cl->S rounded on grp->slot_shift bits.
  */
-static void qfq_slot_insert(struct qfq_group *grp, struct qfq_class *cl,
+static void qfq_slot_insert(struct qfq_sched *q,
+			    struct qfq_group *grp, struct qfq_class *cl,
 			    u64 roundedS)
 {
 	u64 slot = (roundedS - grp->S) >> grp->slot_shift;
 	unsigned int i = (grp->front + slot) % QFQ_MAX_SLOTS;
 
 	if (unlikely(slot >= QFQ_MAX_SLOTS)) {
-		printk_ratelimited(KERN_INFO "slot_insert slot %llu "
-				   "roundedS %llu "
-				   "cl->S %llu "
-				   "grp->S %llu "
-				   "grp->slot_shift %u "
-				   "grp->full_slots = 0x%lx "
-				   "grp->front %u "
-				   "grp->idx %u\n",
-				   slot, roundedS, cl->S, grp->S,
+		printk_ratelimited(KERN_INFO "[%s...%pS] slot %llu "
+				   "V=%llu "
+				   "cl->S=%llu "
+				   "roundedS=%llu "
+				   "grp->S=%llu "
+				   "grp->slot_shift=%u "
+				   "grp->full_slots=0x%lx "
+				   "grp->front=%u "
+				   "grp->idx=%u "
+				   "q->ER=0x%lx "
+				   "q->EB=0x%lx "
+				   "q->IR=0x%lx "
+				   "q->IB=0x%lx\n",
+				   __func__, __builtin_return_address(0),
+				   slot, q->V, cl->S, roundedS, grp->S,
 				   grp->slot_shift, grp->full_slots,
-				   grp->front, grp->index);
+				   grp->front, grp->index, q->bitmaps[ER],
+				   q->bitmaps[EB], q->bitmaps[IR],
+				   q->bitmaps[IB]);
 		slot = QFQ_MAX_SLOTS - 1;
 		i = (grp->front + slot) % QFQ_MAX_SLOTS;
 	}
@@ -881,7 +890,8 @@ static void qfq_update_eligible(struct qfq_sched *q, u64 old_V)
 /*
  * Updates the class, returns true if also the group needs to be updated.
  */
-static bool qfq_update_class(struct qfq_group *grp, struct qfq_class *cl,
+static bool qfq_update_class(struct qfq_sched *q,
+			     struct qfq_group *grp, struct qfq_class *cl,
 			     unsigned int len)
 {
 	/* We do not hold the class lock while updating class variables such as
@@ -905,7 +915,7 @@ static bool qfq_update_class(struct qfq_group *grp, struct qfq_class *cl,
 			return false;
 
 		qfq_front_slot_remove(grp);
-		qfq_slot_insert(grp, cl, roundedS);
+		qfq_slot_insert(q, grp, cl, roundedS);
 	}
 
 	return true;
@@ -1028,7 +1038,7 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 	pr_debug("qfq dequeue: len %u F %lld now %lld\n",
 		 len, (unsigned long long) cl->F, (unsigned long long) q->V);
 
-	if (qfq_update_class(grp, cl, next_len)) {
+	if (qfq_update_class(q, grp, cl, next_len)) {
 		u64 old_F = grp->F;
 
 		q->update_grp_on_deq++;
@@ -1252,7 +1262,7 @@ static void qfq_activate_class(struct qfq_sched *q, struct qfq_class *cl,
 		 (unsigned long long) q->V);
 
 skip_update:
-	qfq_slot_insert(grp, cl, roundedS);
+	qfq_slot_insert(q, grp, cl, roundedS);
 }
 
 
@@ -1450,6 +1460,7 @@ static int qfq_spinner(void *_qdisc)
 	unsigned int skb_len;
 	int rc;
 	int new_skb_deq = 0;
+	int schedule_counter = 0;
 
 	sched_setscheduler(tsk, SCHED_FIFO, &param);
 	printk(KERN_INFO "Kernel thread qfq-spinner on cpu %d args %p q %p\n", smp_processor_id(), sch, q);
@@ -1514,6 +1525,15 @@ static int qfq_spinner(void *_qdisc)
 		HARD_TX_UNLOCK(dev, txq);
 done:
 		local_bh_enable();
+
+		/* Even when there are packets in the queue, we call the
+		 * scheduler occasionally to avoid RCU stalls.
+		 */
+		schedule_counter++;
+		if (schedule_counter >= 100000) {
+			schedule_counter = 0;
+			schedule();
+		}
 	}
 
 	printk(KERN_INFO "Kernel thread qfq-spinner stopped on cpu %d\n", smp_processor_id());
