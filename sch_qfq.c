@@ -1461,6 +1461,7 @@ static int qfq_spinner(void *_qdisc)
 	int rc;
 	int new_skb_deq = 0;
 	int schedule_counter = 0;
+	int queue_index;
 
 	sched_setscheduler(tsk, SCHED_FIFO, &param);
 	printk(KERN_INFO "Kernel thread qfq-spinner on cpu %d args %p q %p\n", smp_processor_id(), sch, q);
@@ -1490,9 +1491,10 @@ static int qfq_spinner(void *_qdisc)
 
 		dev = qdisc_dev(sch);
 
-		/* Always pick queue 0 */
-		skb_set_queue_mapping(skb, 0);
-		txq = netdev_get_tx_queue(dev, 0);
+		/* Hash the skb on to one of the available queues */
+		queue_index = skb_tx_hash(dev, skb);
+		skb_set_queue_mapping(skb, queue_index);
+		txq = netdev_get_tx_queue(dev, queue_index);
 
 		/* Grab the txq lock and try to transmit */
 		HARD_TX_LOCK(dev, txq, smp_processor_id());
