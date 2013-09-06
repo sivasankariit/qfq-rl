@@ -155,13 +155,13 @@ struct qfq_class {
 	u32	inv_w;		/* ONE_FP/weight */
 	u32	lmax;		/* Max packet size for this flow. */
 
-	/* stats variables */
-	u64 idle_on_deq; /* Class was idle after a dequeue from this class */
-	s64 prev_dequeue_time_ns;
-	s64 inter_dequeue_time_ns;
-
-	s64 expected_inter_dequeue_time_ns;
-	s64 absdev_dequeue_time_ns;
+//	/* stats variables */
+//	u64 idle_on_deq; /* Class was idle after a dequeue from this class */
+//	s64 prev_dequeue_time_ns;
+//	s64 inter_dequeue_time_ns;
+//
+//	s64 expected_inter_dequeue_time_ns;
+//	s64 absdev_dequeue_time_ns;
 };
 
 struct qfq_group {
@@ -198,18 +198,18 @@ struct qfq_sched {
 					 * incremented by v_diff_sum.
 					 */
 
-	/* stats variables */
-	u64	v_forwarded;	/* V was forward to match S of some group in
-				 * order to avoid a non work conserving
-				 * schedule
-				 */
-	u64	idle_on_deq; /* Qdisc was idle after a dequeue operation */
-	u64	update_grp_on_deq; /* Group needed update upon dequeue */
-	u64	txq_blocked; /* Interface frozen or stopped while trying to
-			      * transmit skb. For each skb dequeued from qdisc,
-			      * we increment this value at most once (not for
-			      * each time we retry).
-			      */
+//	/* stats variables */
+//	u64	v_forwarded;	/* V was forward to match S of some group in
+//				 * order to avoid a non work conserving
+//				 * schedule
+//				 */
+//	u64	idle_on_deq; /* Qdisc was idle after a dequeue operation */
+//	u64	update_grp_on_deq; /* Group needed update upon dequeue */
+//	u64	txq_blocked; /* Interface frozen or stopped while trying to
+//			      * transmit skb. For each skb dequeued from qdisc,
+//			      * we increment this value at most once (not for
+//			      * each time we retry).
+//			      */
 
 	/* Per CPU locking and queues */
 	unsigned long work_bitmap; /* Indicates scheduled work on different
@@ -432,11 +432,11 @@ static int qfq_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 		}
 	}
 
-	cl->prev_dequeue_time_ns = ktime_get().tv64;
-	cl->inter_dequeue_time_ns = 0;
-
-	cl->expected_inter_dequeue_time_ns = 1482LLU * 8 * 1000 / weight;
-	cl->absdev_dequeue_time_ns = 0;
+//	cl->prev_dequeue_time_ns = ktime_get().tv64;
+//	cl->inter_dequeue_time_ns = 0;
+//
+//	cl->expected_inter_dequeue_time_ns = 1482LLU * 8 * 1000 / weight;
+//	cl->absdev_dequeue_time_ns = 0;
 
 	sch_tree_lock(sch);
 	qdisc_class_hash_insert(&q->clhash, &cl->common);
@@ -593,10 +593,10 @@ static int qfq_dump_class_stats(struct Qdisc *sch, unsigned long arg,
 	struct qfq_class *cl = (struct qfq_class *)arg;
 	struct tc_qfq_xstats xstats = {.type = TCA_QFQ_XSTATS_CLASS};
 
-	xstats.class_stats.idle_on_deq = cl->idle_on_deq;
-	xstats.class_stats.inter_deq_time_ns = cl->inter_dequeue_time_ns;
-	xstats.class_stats.absdev_deq_time_ns = cl->absdev_dequeue_time_ns;
-	xstats.class_stats.expected_inter_dequeue_time_ns = cl->expected_inter_dequeue_time_ns;
+//	xstats.class_stats.idle_on_deq = cl->idle_on_deq;
+//	xstats.class_stats.inter_deq_time_ns = cl->inter_dequeue_time_ns;
+//	xstats.class_stats.absdev_deq_time_ns = cl->absdev_dequeue_time_ns;
+//	xstats.class_stats.expected_inter_dequeue_time_ns = cl->expected_inter_dequeue_time_ns;
 
 	cl->qdisc->qstats.qlen = cl->qdisc->q.qlen;
 	//printk(KERN_INFO "class %p inter_dequeue_time %lld\n", cl, cl->inter_dequeue_time_ns);
@@ -903,7 +903,7 @@ static bool qfq_update_class(struct qfq_sched *q,
 	cl->S = cl->F;
 	if (!len) {
 		qfq_front_slot_remove(grp);	/* queue is empty */
-		cl->idle_on_deq++;
+		//cl->idle_on_deq++;
 	} else if (cl->inv_w == ONE_FP + 1) {
 		qfq_front_slot_remove(grp);	/* weight was changed to zero */
 	} else {
@@ -1001,14 +1001,14 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 	skb = qdisc_dequeue_peeked(cl->qdisc);
 	cl_qlen = qdisc_qlen(cl->qdisc);
 	if (skb && cl_qlen) {
-		s64 now = ktime_get().tv64;
-		s64 dt = now - cl->prev_dequeue_time_ns;
-		s64 dev = dt - cl->expected_inter_dequeue_time_ns;
-		if (dev < 0) dev = -dev;
-		cl->prev_dequeue_time_ns = now;
-		/* Calculate EWMA */
-		cl->inter_dequeue_time_ns = ((cl->inter_dequeue_time_ns * 7) + dt) >> 3;
-		cl->absdev_dequeue_time_ns = ((cl->absdev_dequeue_time_ns * 7) + dev) >> 3;
+//		s64 now = ktime_get().tv64;
+//		s64 dt = now - cl->prev_dequeue_time_ns;
+//		s64 dev = dt - cl->expected_inter_dequeue_time_ns;
+//		if (dev < 0) dev = -dev;
+//		cl->prev_dequeue_time_ns = now;
+//		/* Calculate EWMA */
+//		cl->inter_dequeue_time_ns = ((cl->inter_dequeue_time_ns * 7) + dt) >> 3;
+//		cl->absdev_dequeue_time_ns = ((cl->absdev_dequeue_time_ns * 7) + dev) >> 3;
 		next_len = qdisc_peek_len(cl->qdisc);
 	}
 	spin_unlock(class_lock);
@@ -1041,7 +1041,7 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 	if (qfq_update_class(q, grp, cl, next_len)) {
 		u64 old_F = grp->F;
 
-		q->update_grp_on_deq++;
+		//q->update_grp_on_deq++;
 		if (cl->inv_w && !cl_qlen)
 			q->wsum_active -= ONE_FP / cl->inv_w;
 
@@ -1067,8 +1067,8 @@ static struct sk_buff *qfq_dequeue(struct Qdisc *sch)
 
 skip_unblock:
 	qfq_update_eligible(q, old_V);
-	if (!qdisc_qlen(sch))
-		q->idle_on_deq++;
+//	if (!qdisc_qlen(sch))
+//		q->idle_on_deq++;
 
 	return skb;
 }
@@ -1377,10 +1377,10 @@ static int qfq_dump_qdisc_stats(struct Qdisc *sch, struct gnet_dump *d)
 	struct qfq_sched *q = qdisc_priv(sch);
 	struct tc_qfq_xstats xstats = {.type = TCA_QFQ_XSTATS_QDISC};
 
-	xstats.qdisc_stats.v_forwarded = q->v_forwarded;
-	xstats.qdisc_stats.idle_on_deq = q->idle_on_deq;
-	xstats.qdisc_stats.update_grp_on_deq = q->update_grp_on_deq;
-	xstats.qdisc_stats.txq_blocked = q->txq_blocked;
+//	xstats.qdisc_stats.v_forwarded = q->v_forwarded;
+//	xstats.qdisc_stats.idle_on_deq = q->idle_on_deq;
+//	xstats.qdisc_stats.update_grp_on_deq = q->update_grp_on_deq;
+//	xstats.qdisc_stats.txq_blocked = q->txq_blocked;
 	xstats.qdisc_stats.wsum_active = q->wsum_active;
 
 	return gnet_stats_copy_app(d, &xstats, sizeof(xstats));
@@ -1459,7 +1459,7 @@ static int qfq_spinner(void *_qdisc)
 	struct netdev_queue *txq;
 	unsigned int skb_len;
 	int rc;
-	int new_skb_deq = 0;
+	//int new_skb_deq = 0;
 	int schedule_counter = 0;
 	int queue_index;
 
@@ -1486,7 +1486,7 @@ static int qfq_spinner(void *_qdisc)
 			if (unlikely(!skb))
 				goto done;
 
-			new_skb_deq = 1;
+			//new_skb_deq = 1;
 		}
 
 		dev = qdisc_dev(sch);
@@ -1516,14 +1516,14 @@ static int qfq_spinner(void *_qdisc)
 			if (rc == NETDEV_TX_OK) {
 				txq_trans_update(txq);
 				skb = NULL;
-			} else if (new_skb_deq) {
+			} /* else if (new_skb_deq) {
 				new_skb_deq = 0;
 				q->txq_blocked++;
-			}
-		} else if (new_skb_deq) {
+			} */
+		} /* else if (new_skb_deq) {
 			new_skb_deq = 0;
 			q->txq_blocked++;
-		}
+		} */
 		HARD_TX_UNLOCK(dev, txq);
 done:
 		local_bh_enable();
@@ -1562,10 +1562,10 @@ static int qfq_init_qdisc(struct Qdisc *sch, struct nlattr *opt)
 			INIT_HLIST_HEAD(&grp->slots[j]);
 	}
 
-	q->v_forwarded = 0;
-	q->idle_on_deq = 0;
-	q->update_grp_on_deq = 0;
-	q->txq_blocked = 0;
+//	q->v_forwarded = 0;
+//	q->idle_on_deq = 0;
+//	q->update_grp_on_deq = 0;
+//	q->txq_blocked = 0;
 	q->v_diff_sum = 0;
 	q->t_diff_sum = 0;
 
