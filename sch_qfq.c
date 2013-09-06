@@ -1467,8 +1467,6 @@ static int qfq_spinner(void *_qdisc)
 		if (!skb)
 			qfq_spinner_wait_for_skb(sch);
 
-		local_bh_disable();
-
 		/* Perform work items enqueued by CPUs */
 		qfq_spinner_activate_classes(sch);
 
@@ -1488,9 +1486,6 @@ static int qfq_spinner(void *_qdisc)
 		queue_index = skb_tx_hash(dev, skb);
 		skb_set_queue_mapping(skb, queue_index);
 		txq = netdev_get_tx_queue(dev, queue_index);
-
-		/* Grab the txq lock and try to transmit */
-		HARD_TX_LOCK(dev, txq, smp_processor_id());
 
 		/* The kernel does a lot of stuff which we can quickly
 		 * bypass.  We know the features of our NIC --
@@ -1517,9 +1512,7 @@ static int qfq_spinner(void *_qdisc)
 			new_skb_deq = 0;
 			q->txq_blocked++;
 		} */
-		HARD_TX_UNLOCK(dev, txq);
 done:
-		local_bh_enable();
 
 		/* Even when there are packets in the queue, we call the
 		 * scheduler occasionally to avoid RCU stalls.
