@@ -1410,7 +1410,6 @@ static void qfq_spinner_wait_for_skb(struct Qdisc *sch)
 static void qfq_spinner_activate_classes(struct Qdisc *sch)
 {
 	struct qfq_sched *q = qdisc_priv(sch);
-	spinlock_t *root_lock = qdisc_lock(sch);
 	unsigned int cpu;
 
 	/* We just check the work bitmap without atomicity to see if there is
@@ -1420,7 +1419,6 @@ static void qfq_spinner_activate_classes(struct Qdisc *sch)
 	if (!q->work_bitmap)
 		return;
 
-	spin_lock(root_lock);
 	qfq_update_system_time(qdisc_priv(sch));
 	for_each_possible_cpu(cpu) {
 		struct qfq_cpu_work_queue *work_queue;
@@ -1444,7 +1442,6 @@ static void qfq_spinner_activate_classes(struct Qdisc *sch)
 		}
 		spin_unlock(&work_queue->lock);
 	}
-	spin_unlock(root_lock);
 }
 
 static int qfq_spinner(void *_qdisc)
@@ -1453,7 +1450,6 @@ static int qfq_spinner(void *_qdisc)
 	struct qfq_sched *q = qdisc_priv(sch);
 	struct task_struct *tsk = current;
 	struct sched_param param = { .sched_priority = MAX_RT_PRIO - 1 };
-	spinlock_t *root_lock;
 	struct sk_buff *skb = NULL;
 	struct net_device *dev;
 	struct netdev_queue *txq;
@@ -1478,10 +1474,7 @@ static int qfq_spinner(void *_qdisc)
 
 		if (likely(!skb)) {
 			/* Call the real dequeue function */
-			root_lock = qdisc_lock(sch);
-			spin_lock(root_lock);
 			skb = qfq_dequeue(sch);
-			spin_unlock(root_lock);
 
 			if (unlikely(!skb))
 				goto done;
